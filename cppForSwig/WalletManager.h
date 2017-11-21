@@ -23,6 +23,7 @@ using namespace std;
 #include "Signer.h"
 #include "BlockDataManagerConfig.h"
 #include "CoinSelection.h"
+#include "Script.h"
 
 enum AddressType
 {
@@ -70,6 +71,7 @@ public:
 
    unsigned addRecipient(const BinaryData&, uint64_t);
    void updateRecipient(unsigned, const BinaryData&, uint64_t);
+   void updateOpReturnRecipient(unsigned, const BinaryData&);
    void removeRecipient(unsigned);
    void resetRecipients(void);
 
@@ -170,28 +172,6 @@ public:
    
    const map<BinaryData, uint32_t>& getAddrTxnCountsFromDB(void)
    {
-      auto wallet_aet = wallet_->getDefaultAddressType();
-      uint8_t wltAddrPrefix;
-      
-      switch (wallet_aet)
-      {
-      case AddressEntryType_P2PKH:
-         wltAddrPrefix = BlockDataManagerConfig::getPubkeyHashPrefix();
-         break;
-
-      case AddressEntryType_Nested_Multisig:
-      case AddressEntryType_Nested_P2WSH:
-      case AddressEntryType_Nested_P2WPKH:
-      case AddressEntryType_Nested_P2PK:
-         wltAddrPrefix = BlockDataManagerConfig::getScriptHashPrefix();
-         break;
-
-      default:
-         throw WalletException("unsupported address entry type");
-      }
-
-      bool updateWallet = false;
-
       auto&& countmap = swigWallet_->getAddrTxnCountsFromDB();
 
       for (auto count : countmap)
@@ -202,24 +182,12 @@ public:
          //save count
          countMap_[count.first] = count.second;
 
-         //figure out address type
-         auto prefix = count.first.getPtr();
+         //fetch the asset in wallet
+         auto& assetID = wallet_->getAssetIDForAddr(count.first);
+         auto addrType = wallet_->getAddrTypeForID(assetID);
 
-         if (*prefix == wltAddrPrefix)
-            continue;
-
-         //not the default prefix, let's fetch the asset
-         auto assetIndex = wallet_->getAssetIndexForAddr(count.first);
-         auto asset = wallet_->getAssetForIndex(assetIndex);
-
-
-         auto hashType = asset->getAddressTypeForHash(
-            count.first.getSliceRef(1, count.first.getSize() - 1));
-         updateWallet = asset->setAddressEntryType(hashType);
+         wallet_->getAddressEntryForID(assetID, addrType);
       }
-
-      if (updateWallet)
-         wallet_->update();
 
       return countMap_;
    }
@@ -261,37 +229,45 @@ public:
 
    vector<AddressBookEntry> createAddressBook(void) const
    {
+      if (swigWallet_ == nullptr)
+         return vector<AddressBookEntry>();
+
       return swigWallet_->createAddressBook();
    }
 
-   BinaryData getNestedSWAddrForIndex(unsigned chainIndex)
+   BinaryData getNestedSWAddrForID(const BinaryData& ID)
    {
-      return wallet_->getNestedSWAddrForIndex(chainIndex);
+      auto addrPtr = wallet_->getAddressEntryForID(ID,
+         AddressEntryType(AddressEntryType_P2WPKH | AddressEntryType_P2SH));
+      return addrPtr->getAddress();
    }
 
-   BinaryData getNestedP2PKAddrForIndex(unsigned chainIndex)
+   BinaryData getNestedP2PKAddrForIndex(const BinaryData& ID)
    {
-      return wallet_->getNestedP2PKAddrForIndex(chainIndex);
+      auto addrPtr = wallet_->getAddressEntryForID(ID,
+         AddressEntryType(
+            AddressEntryType_P2PK | 
+            AddressEntryType_Compressed | 
+            AddressEntryType_P2SH
+            ));
+      return addrPtr->getAddress();
    }
 
-   BinaryData getP2PKHAddrForIndex(unsigned chainIndex)
+   BinaryData getP2PKHAddrForIndex(const BinaryData& ID)
    {
-      return wallet_->getP2PKHAddrForIndex(chainIndex);
+      auto addrPtr = wallet_->getAddressEntryForID(ID,
+         AddressEntryType(AddressEntryType_P2PKH));
+      return addrPtr->getAddress();
    }
 
    void extendAddressChain(unsigned count)
    {
-      wallet_->extendChain(count);
+      wallet_->extendPublicChain(count);
    }
 
-   bool extendAddressChainTo(unsigned count)
+   void extendAddressChainToIndex(const BinaryData& id, unsigned count)
    {
-      return wallet_->extendChainTo(count);
-   }
-
-   int getLastComputedIndex(void) const
-   {
-      return wallet_->getLastComputedIndex();
+      wallet_->extendPublicChainToIndex(id, count);
    }
 
    bool hasScrAddr(const BinaryData& scrAddr)
@@ -299,50 +275,26 @@ public:
       return wallet_->hasScrAddr(scrAddr);
    }
 
-   int getAssetIndexForAddr(const BinaryData& scrAddr)
+   const BinaryData& getAssetIDForAddr(const BinaryData& scrAddr)
    {
-      return wallet_->getAssetIndexForAddr(scrAddr);
+      return wallet_->getAssetIDForAddr(scrAddr);
    }
 
-   const BinaryData& getP2SHScriptForHash(const BinaryData& script)
+   const BinaryData& getScriptHashPreimage(const BinaryData& hash)
    {
-      return wallet_->getP2SHScriptForHash(script);
+      auto& assetID = wallet_->getAssetIDForAddr(hash);
+      auto addrPtr = wallet_->getAddressEntryForID(assetID);
+      return addrPtr->getPreimage();
    }
 
-   AddressType getAddrTypeForIndex(int index)
+   AddressEntryType getAddrTypeForID(const BinaryData& ID)
    {
-      auto addrType = wallet_->getAddrTypeForIndex(index);
-
-      AddressType type;
-      switch (addrType)
-      {
-      case AddressEntryType_P2PKH:
-         type = AddressType_P2PKH;
-         break;
-
-      case AddressEntryType_Nested_Multisig:
-      case AddressEntryType_Nested_P2WSH:
-         type = AddressType_Multisig;
-         break;
-
-      case AddressEntryType_Nested_P2WPKH:
-         type = AddressType_P2SH_P2WPKH;
-         break;
-
-      case AddressEntryType_Nested_P2PK:
-         type = AddressType_P2SH_P2PK;
-         break;
-
-      default:
-         throw WalletException("invalid address type");
-      }
-
-      return type;
+      return wallet_->getAddrTypeForID(ID);
    }
 
-   SwigClient::ScrAddrObj getAddrObjByIndex(int index)
+   SwigClient::ScrAddrObj getAddrObjByID(const BinaryData& ID)
    {
-      auto addrPtr = wallet_->getAddressEntryForIndex(index);
+      auto addrPtr = wallet_->getAddressEntryForID(ID);
 
       uint64_t full = 0, spend = 0, unconf = 0;
       auto balanceIter = balanceMap_.find(addrPtr->getPrefixedHash());
@@ -358,6 +310,9 @@ public:
       if (countIter != countMap_.end())
          count = countIter->second;
 
+      BinaryRefReader brr(ID.getRef());
+      brr.advance(ID.getSize() - 4);
+      auto index = brr.get_uint32_t();
 
       if (swigWallet_ != nullptr)
       {
@@ -377,12 +332,6 @@ public:
       }
    }
 
-   SwigClient::ScrAddrObj getImportAddrObjByIndex(int index)
-   {
-      auto importIndex = AssetWallet::convertToImportIndex(index);
-      return getAddrObjByIndex(importIndex);
-   }
-
    int detectHighestUsedIndex(void);
 
    CoinSelectionInstance getCoinSelectionInstance(void)
@@ -391,23 +340,21 @@ public:
    }
 
    unsigned getTopBlock(void);
-
-   bool setImport(int importID, const SecureBinaryData& pubkey);
-   int convertToImportIndex(int);
-   void removeAddressBulk(const vector<BinaryData>&);
 };
 
-class ResolvedFeed_PythonWalletSingle;
+class ResolverFeed_PythonWalletSingle;
 
 ////////////////////////////////////////////////////////////////////////////////
 class PythonSigner
 {
-   friend class ResolvedFeed_PythonWalletSingle;
+   friend class ResolverFeed_PythonWalletSingle;
 
 private:
-   unique_ptr<Signer> signer_;
    shared_ptr<AssetWallet> walletPtr_;
-   shared_ptr<ResolvedFeed_PythonWalletSingle> feedPtr_;
+
+protected:
+   unique_ptr<Signer> signer_;
+   shared_ptr<ResolverFeed_PythonWalletSingle> feedPtr_;
 
 public:
    PythonSigner(WalletContainer& wltContainer)
@@ -421,12 +368,11 @@ public:
       if (walletSingle == nullptr)
          throw WalletException("unexpected wallet type");
 
-      feedPtr_ = make_shared<ResolvedFeed_PythonWalletSingle>(
+      feedPtr_ = make_shared<ResolverFeed_PythonWalletSingle>(
          walletSingle, this);
-
    }
 
-   void addSpender(
+   virtual void addSpender(
       uint64_t value, 
       uint32_t height, uint16_t txindex, uint16_t outputIndex, 
       const BinaryData& txHash, const BinaryData& script, unsigned sequence)
@@ -454,6 +400,8 @@ public:
          recipient = make_shared<Recipient_P2PKH>(txOutRef.scriptRef_, value);
       else if (txOutRef.type_ == p2sh_prefix)
          recipient = make_shared<Recipient_P2SH>(txOutRef.scriptRef_, value);
+      else if (txOutRef.type_ == SCRIPT_PREFIX_OPRETURN)
+         recipient = make_shared<Recipient_OPRETURN>(txOutRef.scriptRef_);
       else
          throw WalletException("unexpected output type");
 
@@ -493,9 +441,145 @@ public:
       return signer_->isInputSW(id);
    }
 
+   BinaryData serializeSignedTx() const
+   {
+      return signer_->serialize();
+   }
+
+   BinaryData serializeState(void) const
+   {
+      return signer_->serializeState();
+   }
+
    virtual ~PythonSigner(void) = 0;
    virtual const SecureBinaryData& getPrivateKeyForIndex(unsigned) = 0;
    virtual const SecureBinaryData& getPrivateKeyForImportIndex(unsigned) = 0;
+};
+
+////////////////////////////////////////////////////////////////////////////////
+class PythonSigner_BCH : public PythonSigner
+{
+public:
+   PythonSigner_BCH(WalletContainer& wltContainer) :
+      PythonSigner(wltContainer)
+   {
+      signer_ = make_unique<Signer_BCH>();
+   }
+
+   void addSpender(
+      uint64_t value,
+      uint32_t height, uint16_t txindex, uint16_t outputIndex,
+      const BinaryData& txHash, const BinaryData& script, unsigned sequence)
+   {
+      UTXO utxo(value, height, txindex, outputIndex, txHash, script);
+
+      //set spenders
+      auto spenderPtr = make_shared<ScriptSpender_BCH>(utxo, feedPtr_);
+      spenderPtr->setSequence(sequence);
+
+      signer_->addSpender(spenderPtr);
+   }
+};
+
+class ResolverFeed_Universal;
+
+////////////////////////////////////////////////////////////////////////////////
+class UniversalSigner
+{
+private:
+   unique_ptr<Signer> signer_;
+   shared_ptr<ResolverFeed_Universal> feedPtr_;
+
+public:
+   UniversalSigner(const string& signerType);
+
+   virtual ~UniversalSigner(void) = 0;
+
+   void updateSignerState(const BinaryData& state)
+   {
+      signer_->deserializeState(state);
+   }
+
+   void populateUtxo(const BinaryData& hash, unsigned txoId, 
+                uint64_t value, const BinaryData& script)
+   {
+      UTXO utxo(value, UINT32_MAX, UINT32_MAX, txoId, hash, script);
+      signer_->populateUtxo(utxo);
+   }
+
+   void signTx(void)
+   {
+      signer_->sign();
+   }
+
+   void setLockTime(unsigned locktime)
+   {
+      signer_->setLockTime(locktime);
+   }
+
+   void setVersion(unsigned version)
+   {
+      signer_->setVersion(version);
+   }
+
+   void addSpenderByOutpoint(
+      const BinaryData& hash, unsigned index, unsigned sequence, uint64_t value)
+   {
+      auto spender = make_shared<ScriptSpender>(hash, index, value);
+      spender->setSequence(sequence);
+
+      signer_->addSpender(spender);
+   }
+
+   void addRecipient(uint64_t value, const BinaryData& script)
+   {
+      auto recipient = make_shared<Recipient_Universal>(script, value);
+      signer_->addRecipient(recipient);
+   }
+
+   BinaryData getSignedTx(void)
+   {
+      BinaryData finalTx(signer_->serialize());
+      return finalTx;
+   }
+
+   const BinaryData& getSigForInputIndex(unsigned id) const
+   {
+      return signer_->getSigForInputIndex(id);
+   }
+
+   BinaryData getWitnessDataForInputIndex(unsigned id)
+   {
+      return BinaryData(signer_->getWitnessData(id));
+   }
+
+   bool isInptuSW(unsigned id) const
+   {
+      return signer_->isInputSW(id);
+   }
+
+   BinaryData serializeState(void) const
+   {
+      return signer_->serializeState();
+   }
+
+   void deserializeState(const BinaryData& state)
+   {
+      signer_->deserializeState(state);
+   }
+
+   TxEvalState getSignedState(void) const
+   {
+      return signer_->evaluateSignedState();
+   }
+
+   BinaryData serializeSignedTx() const
+   {
+      return signer_->serialize();
+   }
+
+   virtual string getPublicDataForKey(const string&) = 0;
+   virtual const SecureBinaryData& getPrivDataForKey(const string&) = 0;
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -519,16 +603,35 @@ public:
 };
 
 ////////////////////////////////////////////////////////////////////////////////
-class ResolvedFeed_PythonWalletSingle : public ResolvedFeed_AssetWalletSingle
+class PythonVerifier_BCH
+{
+private:
+   unique_ptr<Signer_BCH> signer_;
+
+public:
+   PythonVerifier_BCH()
+   {
+      signer_ = make_unique<Signer_BCH>();
+   }
+
+   bool verifySignedTx(const BinaryData& rawTx,
+      const map<BinaryData, map<unsigned, BinaryData> >& utxoMap)
+   {
+      return signer_->verifyRawTx(rawTx, utxoMap);
+   }
+};
+
+////////////////////////////////////////////////////////////////////////////////
+class ResolverFeed_PythonWalletSingle : public ResolverFeed_AssetWalletSingle
 {
 private:
    PythonSigner* signerPtr_ = nullptr;
 
 public:
-   ResolvedFeed_PythonWalletSingle(
+   ResolverFeed_PythonWalletSingle(
       shared_ptr<AssetWallet_Single> walletPtr,
       PythonSigner* signerptr) :
-      ResolvedFeed_AssetWalletSingle(walletPtr),
+      ResolverFeed_AssetWalletSingle(walletPtr),
       signerPtr_(signerptr)
    {
       if (signerPtr_ == nullptr)
@@ -542,12 +645,42 @@ public:
       if (iter == pubkey_to_asset_.end())
          throw runtime_error("invalid value");
 
-      auto id = iter->second->getId();
-      if (id >= 0)
-         return signerPtr_->getPrivateKeyForIndex(id);
+      auto id = iter->second->getIndex();
+      return signerPtr_->getPrivateKeyForIndex(id);
+   }
+};
 
-      id = AssetWallet::convertToImportIndex(id);
-      return signerPtr_->getPrivateKeyForImportIndex(id);
+////////////////////////////////////////////////////////////////////////////////
+class ResolverFeed_Universal : public ResolverFeed
+{
+private:
+   UniversalSigner* signerPtr_ = nullptr;
+
+public:
+   ResolverFeed_Universal(UniversalSigner* signerptr) :
+      signerPtr_(signerptr)
+   {
+      if (signerPtr_ == nullptr)
+         throw WalletException("null signer ptr");
+   }
+
+   const SecureBinaryData& getPrivKeyForPubkey(const BinaryData& pubkey)
+   {
+      auto&& pubkey_hex = pubkey.toHexStr();
+      auto& data = signerPtr_->getPrivDataForKey(pubkey_hex);
+      if (data.getSize() == 0)
+         throw runtime_error("invalid value");
+      return data;
+   }
+
+   BinaryData getByVal(const BinaryData& val)
+   {
+      auto&& val_str = val.toHexStr();
+      auto data_str = signerPtr_->getPublicDataForKey(val_str);
+      if (data_str.size() == 0)
+         throw runtime_error("invalid value");
+      BinaryData data_bd(data_str);
+      return data_bd;
    }
 };
 
@@ -585,7 +718,6 @@ public:
       bdv_ = bdv;
    }
 
-   int getLastComputedIndex(const string& id) const;
    void synchronizeWallet(const string& id, unsigned chainLength);
 
    void duplicateWOWallet(
@@ -594,9 +726,6 @@ public:
       unsigned chainLength);
 
    WalletContainer& getCppWallet(const string& id);
-
-   bool setImport(
-      string wltID, int importID, const SecureBinaryData& pubkey);
 };
 
 #endif

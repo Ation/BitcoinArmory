@@ -166,7 +166,7 @@ public:
       Blockchain &bc
    ) 
    {
-      map<HashString, BlockHeader> &allHeaders = bc.allHeaders();
+      auto& allHeaders = bc.allHeaders();
       
       size_t index=0;
       
@@ -193,7 +193,7 @@ public:
       BlockFilePosition foundAtPosition{ 0, 0 };
             
       bool foundTopBlock = false;
-      auto topBlockHash = bc.top().getThisHash();
+      auto topBlockHash = bc.top()->getThisHash();
 
       const auto stopIfBlkHeaderRecognized =
       [&allHeaders, &foundAtPosition, &foundTopBlock, &topBlockHash] (
@@ -215,11 +215,11 @@ public:
          if(bhIter == allHeaders.end())
             throw StopReading();
 
-         if (bhIter->second.getThisHash() == topBlockHash)
+         if (bhIter->second->getThisHash() == topBlockHash)
             foundTopBlock = true;
 
-         bhIter->second.setBlockFileNum(pos.first);
-         bhIter->second.setBlockFileOffset(pos.second);
+         bhIter->second->setBlockFileNum(pos.first);
+         bhIter->second->setBlockFileOffset(pos.second);
       };
       
       uint64_t returnedOffset = UINT64_MAX;
@@ -452,67 +452,6 @@ public:
 
 private:
 
-   struct MapAndSize
-   {
-      uint8_t* filemap_;
-      uint64_t size_;
-   };
-
-   MapAndSize getMapOfFile(string path, size_t fileSize)
-   {
-      MapAndSize mas;
-
-      #ifdef WIN32
-         int fd = _open(path.c_str(), _O_RDONLY | _O_BINARY);
-         if (fd == -1)
-            throw std::runtime_error("failed to open file");
-         
-         HANDLE fdHandle = (HANDLE)_get_osfhandle(fd);
-         uint32_t sizelo = fileSize & 0xffffffff;
-         uint32_t sizehi = fileSize >> 16 >> 16;
-
-
-         HANDLE mh = CreateFileMapping(fdHandle, NULL, 
-                              PAGE_READONLY | SEC_COMMIT,
-                              sizehi, sizelo, NULL);
-         if (mh == NULL)
-            throw std::runtime_error("failed to map file");
-
-         mas.filemap_ = (uint8_t*)MapViewOfFile(mh, FILE_MAP_READ,
-                             0, 0, fileSize);
-         mas.size_ = fileSize;
-
-         if(mas.filemap_ == NULL)
-            throw std::runtime_error("failed to map file");
-
-         CloseHandle(mh);
-         _close(fd);
-      #else
-         int fd = open(path.c_str(), O_RDONLY);
-         if (fd == -1)
-            throw std::runtime_error("failed to open file");
-
-         mas.filemap_ = (uint8_t*)mmap(NULL, fileSize, PROT_READ, MAP_SHARED, fd, 0);
-         mas.size_ = fileSize;
-
-         if(mas.filemap_ == NULL)
-            throw std::runtime_error("failed to map file");
-         close(fd);
-      #endif
-
-      return mas;
-   }
-
-   void unmapFile(MapAndSize& mas)
-   {
-      #ifdef WIN32
-      if (!UnmapViewOfFile(mas.filemap_))
-         throw std::runtime_error("failed to unmap file");
-      #else
-      if(munmap(mas.filemap_, mas.size_))
-         throw std::runtime_error("failed to unmap file");
-      #endif
-   }
    // read blocks from f, starting at offset blockFileOffset,
    // returning the offset we finished at
    uint64_t readRawBlocksFromFile(
@@ -528,9 +467,9 @@ private:
       if (blockFileOffset >= stopBefore)
          return blockFileOffset;
       
-      MapAndSize mas = getMapOfFile(f.path, f.filesize);
+      auto fmap = DBUtils::getMmapOfFile(f.path);
       BinaryData fileMagic(4);
-      memcpy(fileMagic.getPtr(), mas.filemap_, 4);
+      memcpy(fileMagic.getPtr(), fmap.filePtr_, 4);
       if( fileMagic != magicBytes_ )
       {
          LOGERR << "Block file '" << f.path << "' is the wrong network! File: "
@@ -546,7 +485,7 @@ private:
          // because we haven't gone past that in Headers
          while(pos < (std::min)(f.filesize, stopBefore))
          {
-            magic = BinaryDataRef(mas.filemap_ + pos, 4);
+            magic = BinaryDataRef(fmap.filePtr_ + pos, 4);
             pos += 4;
             if (pos >= f.filesize)
                break;
@@ -554,7 +493,7 @@ private:
             if(magic != magicBytes_)
             {
                // start scanning for MagicBytes
-               uint64_t offset = scanFor(mas.filemap_ + pos, f.filesize - pos,
+               uint64_t offset = scanFor(fmap.filePtr_ + pos, f.filesize - pos,
                   magicBytes_.getPtr(), magicBytes_.getSize());
                if (offset == UINT64_MAX)
                {
@@ -566,13 +505,13 @@ private:
                LOGERR << "Next block header found at offset " << pos-4;
             }
             
-            szstr = BinaryDataRef(mas.filemap_ + pos, 4);
+            szstr = BinaryDataRef(fmap.filePtr_ + pos, 4);
             pos += 4;
             uint32_t blkSize = READ_UINT32_LE(szstr.getPtr());
             if(pos >= f.filesize) 
                break;
 
-            rawBlk = BinaryDataRef(mas.filemap_ +pos, blkSize);
+            rawBlk = BinaryDataRef(fmap.filePtr_ + pos, blkSize);
             pos += blkSize;
             
             try
@@ -594,7 +533,7 @@ private:
       LOGINFO << "Reading raw blocks finished at file "
          << f.fnum << " offset " << blockFileOffset;
       
-      unmapFile(mas);
+      fmap.unmap();
       return blockFileOffset;
    }
    
@@ -774,7 +713,7 @@ protected:
    
    virtual BinaryData applyBlockRangeToDB(
       uint32_t startBlock, uint32_t endBlock, 
-      const vector<string>& wltIDs
+      const vector<string>& wltIDs, bool reportProgress
    )
    {
       //make sure sdbis are initialized (fresh ids wont have sdbi entries)
@@ -813,6 +752,9 @@ protected:
       const auto progress
          = [&](BDMPhase phase, double prog, unsigned time, unsigned numericProgress)
       {
+         if (!reportProgress)
+            return;
+
          auto&& notifPtr = make_unique<BDV_Notification_Progress>(
             phase, prog, time, numericProgress, wltIDs);
 
@@ -824,7 +766,7 @@ protected:
    
    virtual uint32_t currentTopBlockHeight() const
    {
-      return bdm_->blockchain()->top().getBlockHeight();
+      return bdm_->blockchain()->top()->getBlockHeight();
    }
    
    virtual void wipeScrAddrsSSH(const vector<BinaryData>& saVec)
@@ -871,6 +813,8 @@ BlockDataManager::BlockDataManager(
       config_.magicBytes_
       );
 
+   nodeStatusPollMutex_ = make_shared<mutex>();
+
    try
    {
       openDatabase();
@@ -879,20 +823,23 @@ BlockDataManager::BlockDataManager(
       {
          networkNode_ = make_shared<BitcoinP2P>("127.0.0.1", config_.btcPort_,
             *(uint32_t*)config_.magicBytes_.getPtr());
+         nodeRPC_ = make_shared<NodeRPC>(config_);
       }
       else if (bdmConfig.nodeType_ == Node_UnitTest)
       {
          networkNode_ = make_shared<NodeUnitTest>("127.0.0.1", config_.btcPort_,
             *(uint32_t*)config_.magicBytes_.getPtr());
+         nodeRPC_ = make_shared<NodeRPC_UnitTest>(config_);
       }
       else
       {
          throw DbErrorMsg("invalid node type in bdmConfig");
       }
 
-      nodeRPC_ = make_shared<NodeRPC>(config_);
+      config_.armoryDbType_ = iface_->armoryDbType();
 
-      zeroConfCont_ = make_shared<ZeroConfContainer>(iface_, networkNode_);
+      zeroConfCont_ = make_shared<ZeroConfContainer>(
+         iface_, networkNode_, config_.zcThreadCount_);
       scrAddrData_ = make_shared<BDM_ScrAddrFilter>(this);
    }
    catch (...)
@@ -935,10 +882,12 @@ BlockDataManager::~BlockDataManager()
    dbBuilder_.reset();
    networkNode_.reset();
    readBlockHeaders_.reset();
-   iface_->closeDatabases();
    scrAddrData_.reset();
-   delete iface_;
    
+   if (iface_ != nullptr)
+      iface_->closeDatabases();
+   delete iface_;
+
    blockchain_.reset();
 }
 
@@ -1062,9 +1011,12 @@ void BlockDataManager::resetDatabases(ResetDBMode mode)
       return;
    }
 
-   //we keep all scrAddr data in between db reset/clear
-   scrAddrData_->getAllScrAddrInDB();
-
+   if (config_.armoryDbType_ != ARMORY_DB_SUPER)
+   {
+      //we keep all scrAddr data in between db reset/clear
+      scrAddrData_->getAllScrAddrInDB();
+   }
+   
    switch (mode)
    {
    case Reset_Rescan:
@@ -1077,10 +1029,14 @@ void BlockDataManager::resetDatabases(ResetDBMode mode)
       break;
    }
 
-   //reapply scrAddrData_'s content to the db
-   scrAddrData_->putAddrMapInDB();
 
-   scrAddrData_->clear();
+   if (config_.armoryDbType_ != ARMORY_DB_SUPER)
+   {
+      //reapply scrAddrData_'s content to the db
+      scrAddrData_->putAddrMapInDB();
+
+      scrAddrData_->clear();
+   }
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1202,23 +1158,26 @@ shared_future<bool> BlockDataManager::registerAddressBatch(
 ////////////////////////////////////////////////////////////////////////////////
 void BlockDataManager::enableZeroConf(bool clearMempool)
 {
-   SCOPED_TIMER("enableZeroConf");
-   LOGINFO << "Enabling zero-conf tracking ";
-   zcEnabled_ = true;
+   if (zeroConfCont_ == nullptr)
+      throw runtime_error("null zc object");
 
-   auto zcFilter = [this](void)->shared_ptr<set<ScrAddrFilter::AddrSyncState>>
-   { 
-      return scrAddrData_->getScrAddrSet();
-   };
+   zeroConfCont_->init(scrAddrData_, clearMempool);
+}
 
-   zeroConfCont_->init(zcFilter, clearMempool);
+////////////////////////////////////////////////////////////////////////////////
+bool BlockDataManager::isZcEnabled(void) const
+{
+   if (zeroConfCont_ == nullptr)
+      return false;
+
+   return zeroConfCont_->isEnabled();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 void BlockDataManager::disableZeroConf(void)
 {
-   SCOPED_TIMER("disableZeroConf");
-   zcEnabled_ = false;
+   if (zeroConfCont_ == nullptr)
+      return;
 
    zeroConfCont_->shutdown();
 }
@@ -1240,6 +1199,43 @@ NodeStatusStruct BlockDataManager::getNodeStatus() const
       return nss;
 
    nss.rpcStatus_ = nodeRPC_->testConnection();
+   if (nss.rpcStatus_ != RpcStatus_Online)
+      pollNodeStatus();
+
    nss.chainState_ = nodeRPC_->getChainStatus();
    return nss;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+void BlockDataManager::pollNodeStatus() const
+{
+   if (!nodeRPC_->canPool())
+      return;
+
+   unique_lock<mutex> lock(*nodeStatusPollMutex_, defer_lock);
+
+   if (!lock.try_lock())
+      return;
+
+   auto poll_thread = [this](void)->void
+   {
+      auto nodeRPC = this->nodeRPC_;
+      auto mutexPtr = this->nodeStatusPollMutex_;
+
+      unique_lock<mutex> lock(*mutexPtr);
+
+      unsigned count = 0;
+      while (nodeRPC->testConnection() != RpcStatus_Online)
+      {
+         ++count;
+         if (count > 10)
+            break; //give up after 20sec
+
+         this_thread::sleep_for(chrono::seconds(2));
+      }
+   };
+
+   thread pollThr(poll_thread);
+   if (pollThr.joinable())
+      pollThr.detach();
 }

@@ -48,6 +48,8 @@ class LedgerEntryData;
 #define TX_NOT_EXIST       -1
 #define TX_OFF_MAIN_BRANCH -2
 
+#define SEGWIT_ADDRESS_MAINNET_HEADER "bc"
+#define SEGWIT_ADDRESS_TESTNET_HEADER "tb"
 
 #define HashString     BinaryData
 #define HashStringRef  BinaryDataRef
@@ -106,7 +108,8 @@ typedef enum
    TXOUT_SCRIPT_P2SH,
    TXOUT_SCRIPT_NONSTANDARD,
    TXOUT_SCRIPT_P2WPKH,
-   TXOUT_SCRIPT_P2WSH
+   TXOUT_SCRIPT_P2WSH,
+   TXOUT_SCRIPT_OPRETURN
 }  TXOUT_SCRIPT_TYPE;
 
 typedef enum
@@ -130,8 +133,11 @@ typedef enum
   SCRIPT_PREFIX_P2SH=0x05,
   SCRIPT_PREFIX_HASH160_TESTNET=0x6f,
   SCRIPT_PREFIX_P2SH_TESTNET=0xc4,
+  SCRIPT_PREFIX_P2WPKH=0x90,
+  SCRIPT_PREFIX_P2WSH=0x95,
   SCRIPT_PREFIX_MULTISIG=0xfe,
   SCRIPT_PREFIX_NONSTD=0xff,
+  SCRIPT_PREFIX_OPRETURN=0x6a
 } SCRIPT_PREFIX;
 
 
@@ -989,10 +995,15 @@ public:
    // TXOUT_SCRIPT_MULTISIG,
    // TXOUT_SCRIPT_P2SH,
    // TXOUT_SCRIPT_NONSTANDARD,
+   // TXOUT_SCRIPT_P2WPKH,
+   // TXOUT_SCRIPT_P2WSH,
+   // TXOUT_SCRIPT_OPRETURN
    static TXOUT_SCRIPT_TYPE getTxOutScriptType(BinaryDataRef s)
    {
       size_t sz = s.getSize();
-      if (sz < 21)
+      if (sz > 0 && sz < 81 && s[0] == 0x6a)
+         return TXOUT_SCRIPT_OPRETURN;
+      else if (sz < 21)
          return TXOUT_SCRIPT_NONSTANDARD;
       else if (sz == 22 &&
          s[0] == 0x00 &&
@@ -1783,7 +1794,7 @@ public:
       return base58_encode(scriptNhash);
    }
 
-   static BinaryData base58toScriptAddr(const BinaryData& b58Addr)
+   static BinaryData base58toScrAddr(const BinaryData& b58Addr)
    {
       //decode
       auto&& scriptNhash = base58_decode(b58Addr);
@@ -2003,7 +2014,10 @@ public:
    static SecureBinaryData computeChainCode_Armory135(
       const SecureBinaryData& privateRoot);
 
-   static BinaryData getP2WPKHScript(const BinaryData& scriptHash)
+   static BinaryData computeDataId(const SecureBinaryData& data,
+      const string& message);
+
+   static BinaryData getP2PKHScript(const BinaryData& scriptHash)
    {
       if (scriptHash.getSize() != 20)
          throw runtime_error("invalid P2WPKH hash size");
@@ -2019,7 +2033,76 @@ public:
       return bw.getData();
    }
 
-   static BinaryData getP2WSHScript(const BinaryData& scriptHash)
+   static BinaryData getP2PKScript(const BinaryData& pubkey)
+   {
+      if (pubkey.getSize() != 33 && pubkey.getSize() != 65)
+         throw runtime_error("invalid pubkey size");
+
+      BinaryWriter bw;
+      bw.put_var_int(pubkey.getSize());
+      bw.put_BinaryData(pubkey);
+      bw.put_uint8_t(OP_CHECKSIG);
+
+      return bw.getData();
+   }
+
+   static BinaryData getP2SHScript(const BinaryData& scriptHash)
+   {
+      if (scriptHash.getSize() != 20)
+         throw runtime_error("invalid P2WPKH hash size");
+
+      BinaryWriter bw;
+      bw.put_uint8_t(OP_HASH160);
+      bw.put_uint8_t(20);
+      bw.put_BinaryData(scriptHash);
+      bw.put_uint8_t(OP_EQUAL);
+
+      return bw.getData();
+   }
+
+   static BinaryData getP2WPKHOutputScript(const BinaryData& scriptHash)
+   {
+      if (scriptHash.getSize() != 20)
+         throw runtime_error("invalid P2WPKH hash size");
+
+      BinaryWriter bw;
+      bw.put_uint8_t(0);
+      bw.put_uint8_t(20);
+      bw.put_BinaryData(scriptHash);
+
+      return bw.getData();
+   }
+
+   static BinaryData getP2WPKHWitnessScript(const BinaryData& scriptHash)
+   {
+      if (scriptHash.getSize() != 20)
+         throw runtime_error("invalid P2WPKH hash size");
+
+      BinaryWriter bw;
+      bw.put_uint8_t(OP_DUP);
+      bw.put_uint8_t(OP_HASH160);
+      bw.put_uint8_t(20);
+      bw.put_BinaryData(scriptHash);
+      bw.put_uint8_t(OP_EQUALVERIFY);
+      bw.put_uint8_t(OP_CHECKSIG);
+
+      return bw.getData();
+   }
+
+   static BinaryData getP2WSHOutputScript(const BinaryData& scriptHash)
+   {
+      if (scriptHash.getSize() != 32)
+         throw runtime_error("invalid P2WPKH hash size");
+
+      BinaryWriter bw;
+      bw.put_uint8_t(0);
+      bw.put_uint8_t(32);
+      bw.put_BinaryData(scriptHash);
+
+      return bw.getData();
+   }
+
+   static BinaryData getP2WSHWitnessScript(const BinaryData& scriptHash)
    {
       if (scriptHash.getSize() != 32)
          throw runtime_error("invalid P2WPKH hash size");
@@ -2035,6 +2118,9 @@ public:
 
    static string base64_encode(const string&);
    static string base64_decode(const string&);
+
+   static BinaryData scrAddrToSegWitAddress(const BinaryData& scrAddr);
+   static BinaryData segWitAddressToScrAddr(const BinaryData& swAddr);
 };
    
 static inline void suppressUnusedFunctionWarning()

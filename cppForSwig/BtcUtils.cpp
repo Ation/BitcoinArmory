@@ -12,6 +12,7 @@
 #include "base64.h"
 #include "EncryptionUtils.h"
 #include "BlockDataManagerConfig.h"
+#include "bech32/ref/c++/segwit_addr.h"
 
 
 const BinaryData BtcUtils::BadAddress_ = BinaryData::CreateFromHex("0000000000000000000000000000000000000000");
@@ -114,6 +115,27 @@ SecureBinaryData BtcUtils::computeChainCode_Armory135(
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+BinaryData BtcUtils::computeDataId(const SecureBinaryData& data,
+   const string& message)
+{
+   if (data.getSize() == 0)
+      throw runtime_error("cannot compute id for empty data");
+
+   if (message.size() == 0)
+      throw runtime_error("cannot compute id for empty message");
+
+   //hmac the hash256 of the data with message
+   auto&& hmacKey = BtcUtils::hash256(data);
+   BinaryData id(32);
+
+   getHMAC256(hmacKey.getPtr(), hmacKey.getSize(),
+      message.c_str(), message.size(), id.getPtr());
+
+   //return last 16 bytes
+   return id.getSliceCopy(16, 16);
+}
+
+////////////////////////////////////////////////////////////////////////////////
 BinaryData BtcUtils::rsToDerSig(BinaryDataRef bdr)
 {
    if (bdr.getSize() != 64)
@@ -198,11 +220,11 @@ BinaryData BtcUtils::getTxOutScrAddr(BinaryDataRef script,
          bw.put_BinaryData(script.getSliceCopy(3, 20));
          return bw.getData();
       case(TXOUT_SCRIPT_P2WPKH) :
-         bw.put_uint8_t(h160Prefix);
+         bw.put_uint8_t(SCRIPT_PREFIX_P2WPKH);
          bw.put_BinaryData(script.getSliceCopy(2, 20));
          return bw.getData();
       case(TXOUT_SCRIPT_P2WSH) :
-         bw.put_uint8_t(scriptPrefix);
+         bw.put_uint8_t(SCRIPT_PREFIX_P2WSH);
          bw.put_BinaryData(script.getSliceCopy(2, 32));
          return bw.getData();
       case(TXOUT_SCRIPT_STDPUBKEY65) :
@@ -225,6 +247,20 @@ BinaryData BtcUtils::getTxOutScrAddr(BinaryDataRef script,
          bw.put_uint8_t(SCRIPT_PREFIX_MULTISIG);
          bw.put_BinaryData(getMultisigUniqueKey(script));
          return bw.getData();
+      case(TXOUT_SCRIPT_OPRETURN) :
+      {
+         bw.put_uint8_t(SCRIPT_PREFIX_NONSTD);
+         unsigned msg_pos = 1;
+         if (script.getSize() > 77)
+            msg_pos += 2;
+         else if (script.getSize() > 1)
+            ++msg_pos;
+
+         bw.put_BinaryData(
+            script.getSliceRef(msg_pos, script.getSize() - msg_pos));
+         return bw.getData();
+      }
+
       default:
          LOGERR << "What kind of TxOutScript did we get?";
          return BinaryData(0);
@@ -241,7 +277,7 @@ TxOutScriptRef BtcUtils::getTxOutScrAddrNoCopy(BinaryDataRef script)
       SCRIPT_PREFIX(BlockDataManagerConfig::getPubkeyHashPrefix());
    auto p2sh_prefix = 
       SCRIPT_PREFIX(BlockDataManagerConfig::getScriptHashPrefix());
-
+   
    auto type = getTxOutScriptType(script);
    switch (type)
    {
@@ -254,14 +290,14 @@ TxOutScriptRef BtcUtils::getTxOutScrAddrNoCopy(BinaryDataRef script)
 
    case(TXOUT_SCRIPT_P2WPKH) :
    {
-      outputRef.type_ = p2pkh_prefix;
+      outputRef.type_ = SCRIPT_PREFIX_P2WPKH;
       outputRef.scriptRef_ = move(script.getSliceRef(2, 20));
       break;
    }
 
    case(TXOUT_SCRIPT_P2WSH) :
    {
-      outputRef.type_ = p2sh_prefix;
+      outputRef.type_ = SCRIPT_PREFIX_P2WSH;
       outputRef.scriptRef_ = move(script.getSliceRef(2, 32));
       break;
    }
@@ -305,6 +341,20 @@ TxOutScriptRef BtcUtils::getTxOutScrAddrNoCopy(BinaryDataRef script)
       break;
    }
 
+   case(TXOUT_SCRIPT_OPRETURN) :
+   {
+      outputRef.type_ = SCRIPT_PREFIX_OPRETURN;
+      auto size = script.getSize();
+      size_t pos = 1;
+      if (size > 77)
+         pos += 2;
+      if (size > 1)
+         ++pos;
+
+      outputRef.scriptRef_ = script.getSliceRef(pos, size - pos);
+      break;
+   }
+
    default:
       LOGERR << "What kind of TxOutScript did we get?";
    }
@@ -333,4 +383,56 @@ string BtcUtils::base64_decode(const string& in)
    base64e.MessageEnd();
 
    return output;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+BinaryData BtcUtils::scrAddrToSegWitAddress(const BinaryData& scrAddr)
+{
+   //hardcoded for version 0 witness programs for now
+   string header;
+
+   if (BlockDataManagerConfig::getPubkeyHashPrefix() == SCRIPT_PREFIX_HASH160)
+      header = move(string(SEGWIT_ADDRESS_MAINNET_HEADER));
+   else if (BlockDataManagerConfig::getPubkeyHashPrefix() == SCRIPT_PREFIX_HASH160_TESTNET &&
+      BlockDataManagerConfig::getPubkeyHashPrefix() == SCRIPT_PREFIX_HASH160_TESTNET)
+      header = move(string(SEGWIT_ADDRESS_TESTNET_HEADER));
+   else
+      throw runtime_error("invalid network for segwit address");
+
+   auto&& result = segwit_addr::encode(
+      header, 0, scrAddr.getDataVector());
+
+   if (result.size() == 0)
+      throw runtime_error("failed to encode to sw address!");
+
+   return BinaryData(result);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+BinaryData BtcUtils::segWitAddressToScrAddr(const BinaryData& swAddr)
+{
+   string header;
+
+   if (BlockDataManagerConfig::getPubkeyHashPrefix() == SCRIPT_PREFIX_HASH160)
+      header = move(string(SEGWIT_ADDRESS_MAINNET_HEADER));
+   else if (BlockDataManagerConfig::getPubkeyHashPrefix() == SCRIPT_PREFIX_HASH160_TESTNET &&
+      BlockDataManagerConfig::getPubkeyHashPrefix() == SCRIPT_PREFIX_HASH160_TESTNET)
+      header = move(string(SEGWIT_ADDRESS_TESTNET_HEADER));
+   else
+      throw runtime_error("invalid network for segwit address");
+
+   string swAddr_str(swAddr.getCharPtr(), swAddr.getSize());
+   auto&& result = segwit_addr::decode(header, swAddr_str);
+
+   if (result.first == -1)
+      throw runtime_error("failed to decode sw address!");
+
+   if (result.second.size() == 0)
+      throw runtime_error("empty sw program buffer");
+
+   if (result.first != 0)
+      throw runtime_error("only supporting sw version 0 for now");
+
+   BinaryData scrAddr(&result.second[0], result.second.size());
+   return scrAddr;
 }
